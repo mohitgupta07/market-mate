@@ -1,70 +1,71 @@
-#pip install fastapi uvicorn nest_asyncio itsdangerous python-multipart
-from fastapi import FastAPI, Request, Response, Form, HTTPException, status
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-import uuid
-from itsdangerous import URLSafeSerializer
-import uvicorn
+from fastapi import FastAPI, Depends
+from fastapi_users import FastAPIUsers
+from fastapi_users_db_sqlalchemy import SQLAlchemyUserDatabase
+from fastapi_users.authentication import CookieTransport, AuthenticationBackend, JWTStrategy
+from fastapi_users.password import PasswordHelper
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import sessionmaker
+from typing import AsyncGenerator
 
+from auth.database import engine, SessionLocal, Base
+from auth.models import User
+from auth.schemas import UserRead, UserCreate, UserUpdate
 
+SECRET = "SUPERSECRETKEY"
+
+# Dependency
+async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
+    async with SessionLocal() as session:
+        yield session
+
+# Adapter
+async def get_user_db(session: AsyncSession = Depends(get_async_session)):
+    yield SQLAlchemyUserDatabase(session, User)
+
+# Auth backend
+cookie_transport = CookieTransport(cookie_name="auth", cookie_max_age=3600)
+
+def get_jwt_strategy() -> JWTStrategy:
+    return JWTStrategy(secret=SECRET, lifetime_seconds=3600)
+
+auth_backend = AuthenticationBackend(
+    name="cookie",
+    transport=cookie_transport,
+    get_strategy=get_jwt_strategy,
+)
+
+# FastAPI Users setup
+fastapi_users = FastAPIUsers(
+    get_user_db,
+    [auth_backend],
+)
+
+# Create app and routes
 app = FastAPI()
 
-# In-memory session store (session_id → username)
-session_store = {}
+app.include_router(
+    fastapi_users.get_auth_router(auth_backend), prefix="/auth/jwt", tags=["auth"]
+)
+app.include_router(
+    fastapi_users.get_register_router(user_schema=UserRead, user_create_schema=UserCreate), prefix="/auth", tags=["auth"]
+)
+app.include_router(
+    fastapi_users.get_users_router(user_schema=UserRead, user_update_schema=UserUpdate), prefix="/users", tags=["users"]
+)
 
-# Secure serializer for cookies
-SECRET_KEY = "super-secret-key"  # Replace with env variable in prod
-serializer = URLSafeSerializer(SECRET_KEY)
+@app.get("/protected")
+async def protected_route(user: UserRead = Depends(fastapi_users.current_user())):
+    return {"message": f"Hello {user.email}"}
 
-SESSION_COOKIE_NAME = "session_id"
-
-
-async def authenticate_user(username, password):
-    if username == "admin" and password == "password":
-        return True
-    else:
-        return False
-
-
-@app.post("/login")
-async def login(
-    response: Response,
-    username: str = Form(...),
-    password: str = Form(...),
-):
-    user = await authenticate_user(username, password)
-    if not user:
-        return JSONResponse(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            content={"message": "Invalid username or password"},
-        )
-    # 2. Create session ID
-    session_id = str(uuid.uuid4())
-    session_store[session_id] = username
-    # 3. Sign it and set in cookie
-    signed_session = serializer.dumps(session_id)
-    response.set_cookie(key=SESSION_COOKIE_NAME, value=signed_session, httponly=True)
-
-    return {"message": "Login successful", "username": username}
-
-
-@app.get("/me")
-async def get_current_user(request: Request):
-  # 1. Read signed session ID from cookie
-  signed_session = request.cookies.get(SESSION_COOKIE_NAME)
-  if not signed_session:
-      raise HTTPException(status_code=401, detail="Not logged in")
-
-  try:
-      session_id = serializer.loads(signed_session)
-      username = session_store.get(session_id)
-      if not username:
-          raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session")
-  except Exception:
-      raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid cookie or session")
-
-  return {"username": username}
+# DB setup on startup 
+# using this as it lets swagger work at localhost:8000/docs
+@app.on_event("startup")
+async def on_startup():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
 
 
-uvicorn.run(app, host="127.0.0.1", port=8000)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)

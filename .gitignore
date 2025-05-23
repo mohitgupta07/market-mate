@@ -1,2 +1,5 @@
 .venv
 .idea
+test.db
+__pycache__
+*.pyc
