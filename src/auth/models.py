@@ -17,6 +17,9 @@ class User(SQLAlchemyBaseUserTable[int], Base):  # Or UUID instead of int
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(String, unique=True, index=True, nullable=False)
     hashed_password: Mapped[str] = mapped_column(String, nullable=False)
+    is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
+    is_superuser: Mapped[bool] = mapped_column(default=False, nullable=False)
+    is_verified: Mapped[bool] = mapped_column(default=False, nullable=False)
     full_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
     conversations: Mapped[List["Conversation"]] = relationship(back_populates="user")

@@ -43,8 +43,8 @@ class UserManager(BaseUserManager[User, int]):
     def __init__(self, user_db: SQLAlchemyUserDatabase):
         super().__init__(user_db)
 
-    async def parse_id(self, value: str) -> int:
-        return int(await value) if hasattr(value, '__await__') else int(value)
+    def parse_id(self, value: str) -> int:
+        return int(value)
 
 async def get_user_manager(user_db=Depends(get_user_db)):
     yield UserManager(user_db)
