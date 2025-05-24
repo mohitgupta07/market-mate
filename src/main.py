@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Depends
 from fastapi_users import FastAPIUsers
+from fastapi_users.manager import BaseUserManager, UserManagerDependency
 from fastapi_users_db_sqlalchemy import SQLAlchemyUserDatabase
 from fastapi_users.authentication import CookieTransport, AuthenticationBackend, JWTStrategy
 from fastapi_users.password import PasswordHelper
@@ -34,9 +35,26 @@ auth_backend = AuthenticationBackend(
     get_strategy=get_jwt_strategy,
 )
 
+class UserManager(BaseUserManager[User, int]):
+    user_db_model = User
+    reset_password_token_secret = SECRET
+    verification_token_secret = SECRET
+
+    def __init__(self, user_db: SQLAlchemyUserDatabase):
+        super().__init__(user_db)
+
+    async def parse_id(self, value: str) -> int:
+        return int(await value) if hasattr(value, '__await__') else int(value)
+
+async def get_user_manager(user_db=Depends(get_user_db)):
+    yield UserManager(user_db)
+
 # FastAPI Users setup
-fastapi_users = FastAPIUsers(
-    get_user_db,
+fastapi_users = FastAPIUsers[
+    User,
+    int
+](
+    get_user_manager,
     [auth_backend],
 )
 
@@ -63,8 +81,6 @@ async def protected_route(user: UserRead = Depends(fastapi_users.current_user())
 async def on_startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-
-
 
 if __name__ == "__main__":
     import uvicorn
