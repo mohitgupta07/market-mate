@@ -1,0 +1,9 @@
+fastapi[all]
+sqlalchemy
+aiosqlite
+python-jose[cryptography]
+bcrypt
+python-multipart
+pytest
+pytest-asyncio
+aiohttp

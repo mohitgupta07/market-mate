@@ -4,6 +4,7 @@ from auth.database import engine, Base
 from auth.users import fastapi_users, auth_backend
 from auth.schemas import UserRead, UserCreate, UserUpdate
 from auth.models import User  # Important: import models to ensure they're registered with Base
+from chat import router as chat_router
 
 # Create app and routes
 app = FastAPI()
@@ -17,6 +18,9 @@ app.include_router(
 app.include_router(
     fastapi_users.get_users_router(user_schema=UserRead, user_update_schema=UserUpdate), prefix="/users", tags=["users"]
 )
+
+# Include chat routes
+app.include_router(chat_router, prefix="/chat", tags=["chat"])
 
 @app.get("/protected")
 async def protected_route(user: UserRead = Depends(fastapi_users.current_user())):
