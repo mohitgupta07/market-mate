@@ -2,7 +2,7 @@ from fastapi_users import FastAPIUsers
 from fastapi_users.manager import BaseUserManager
 from fastapi_users_db_sqlalchemy import SQLAlchemyUserDatabase
 from fastapi_users.authentication import CookieTransport, AuthenticationBackend, JWTStrategy
-from fastapi.security import OAuth2PasswordRequestForm
+
 from fastapi import Depends
 from typing import AsyncGenerator
 
@@ -10,12 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .database import SessionLocal
 from .models import User
-from .schemas import UserRead, UserCreate, UserUpdate
+
 
 SECRET = "SUPERSECRETKEY"
 
 # Dependency
-async def get_async_session() -> AsyncGenerator[SessionLocal, None]:
+async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
     async with SessionLocal() as session:
         yield session
 
