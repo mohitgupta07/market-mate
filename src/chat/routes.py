@@ -3,32 +3,34 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.auth.users import fastapi_users
 from src.auth.database import SessionLocal
 from src.auth.models import User, Conversation, Message, RoleEnum
-from .lang_graph import graph
+from sqlalchemy import select
 import uuid
 from typing import Dict
+import os
 
 router = APIRouter()
-langgraph_memory: Dict[uuid.UUID, dict] = {}
 
 async def get_db():
     async with SessionLocal() as session:
         yield session
 
-@router.post("/start_session")
-async def start_session(
+# Example: simple rate limiter (mock, not production)
+# RATE_LIMITS = {"free": 10, "pro": 100, "enterprise": 1000}  # requests per hour
+# user_request_counts = {}  # In production, use Redis or similar
+
+@router.post("/create_session")
+async def create_session(
     user: User = Depends(fastapi_users.current_user()),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    llm_model: str = "gpt-3.5-turbo"  # Allow user to specify model, default to gpt-3.5-turbo
 ):
-    """Start a new chat session"""
-    session = Conversation(user_id=user.id)
+    """Create a new chat session"""
+    session = Conversation(user_id=user.id, llm_model=llm_model)
     db.add(session)
     await db.commit()
     await db.refresh(session)
     
-    # Initialize memory
-    langgraph_memory[session.id] = {"history": []}
-    
-    return {"session_id": str(session.id)}
+    return {"session_id": str(session.id), "llm_model": session.llm_model}
 
 @router.post("/message/{session_id}")
 async def message(
@@ -43,52 +45,10 @@ async def message(
     if not session or session.user_id != user.id:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Store user message
-    db.add(Message(
-        conversation_id=session_id,
-        role=RoleEnum.user,
-        content=message
-    ))
-    await db.commit()    # Process with LangGraph
-    memory = langgraph_memory.get(session_id, {"history": []})
-    result = graph(message, memory["history"])
-    langgraph_memory[session_id] = {"history": result["history"]}
-
-    # Store assistant response
-    db.add(Message(
-        conversation_id=session_id,
-        role=RoleEnum.ai,
-        content=result["output"]
-    ))
-    await db.commit()
-
+    # Call the LangGraph runner as the only handler
+    from .lang_graph import run_chat_graph
+    result = await run_chat_graph(session=session, user_message=message, db=db)
     return {"reply": result["output"]}
-
-@router.post("/restart_session/{session_id}")
-async def restart_session(
-    session_id: uuid.UUID,
-    user: User = Depends(fastapi_users.current_user()),
-    db: AsyncSession = Depends(get_db)
-):
-    """Restart a chat session"""
-    session = await db.get(Conversation, session_id)
-    if not session or session.user_id != user.id:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    # Clear memory if exists
-    if session_id in langgraph_memory:
-        del langgraph_memory[session_id]
-
-    # Create new session
-    new_session = Conversation(user_id=user.id)
-    db.add(new_session)
-    await db.commit()
-    await db.refresh(new_session)
-
-    # Initialize new memory
-    langgraph_memory[new_session.id] = {"history": []}
-
-    return {"new_session_id": str(new_session.id)}
 
 @router.get("/sessions")
 async def list_sessions(
@@ -159,31 +119,16 @@ async def get_session(
         ]
     }
 
-@router.post("/sessions/{session_id}/resume")
-async def resume_session(
+@router.delete("/sessions/{session_id}")
+async def delete_session(
     session_id: uuid.UUID,
     user: User = Depends(fastapi_users.current_user()),
     db: AsyncSession = Depends(get_db)
 ):
-    """Resume a chat session by loading its history into memory"""
-    # Get session and verify ownership
+    """Delete a chat session and its messages"""
     session = await db.get(Conversation, session_id)
     if not session or session.user_id != user.id:
         raise HTTPException(status_code=404, detail="Session not found")
-
-    # Get messages
-    result = await db.execute(
-        Message.__table__.select().where(Message.conversation_id == session_id)
-    )
-    messages = result.fetchall()
-
-    # Reconstruct history
-    history = [
-        {"role": msg.role, "content": msg.content}
-        for msg in messages
-    ]
-
-    # Update memory
-    langgraph_memory[session_id] = {"history": history}
-
-    return {"message": "Session resumed successfully"}
+    await db.delete(session)
+    await db.commit()
+    return {"message": f"Session {session_id} deleted successfully."}

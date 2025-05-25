@@ -21,7 +21,9 @@ class User(SQLAlchemyBaseUserTable[int], Base):  # Or UUID instead of int
     is_superuser: Mapped[bool] = mapped_column(default=False, nullable=False)
     is_verified: Mapped[bool] = mapped_column(default=False, nullable=False)
     full_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-
+    
+    # Add tier system for rate limiting
+    tier: Mapped[str] = mapped_column(String, default="free", nullable=False)  # e.g., free, pro, enterprise
     conversations: Mapped[List["Conversation"]] = relationship(back_populates="user")
 
 
@@ -34,6 +36,8 @@ class Conversation(Base):
     title: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # Store latest summary for this conversation
+    llm_model: Mapped[str] = mapped_column(String, default="gpt-3.5-turbo", nullable=False)  # Store selected LLM model for this conversation
 
     user: Mapped["User"] = relationship(back_populates="conversations")
     messages: Mapped[List["Message"]] = relationship(back_populates="conversation", cascade="all, delete")
@@ -41,7 +45,8 @@ class Conversation(Base):
 
 # --- Enum for message roles ---
 class RoleEnum(str, enum.Enum):
-    user = "user"
+    system = "system"
+    user = "human"
     ai = "ai"
 
 
