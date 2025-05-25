@@ -46,8 +46,9 @@ async def message(
         raise HTTPException(status_code=404, detail="Session not found")
 
     # Call the LangGraph runner as the only handler
-    from .lang_graph import run_chat_graph
-    result = await run_chat_graph(session=session, user_message=message, db=db)
+    from .lang_graph import run_chat_graph, update_conversation_state
+    result = await run_chat_graph(session=session, user_message=message, user= user)
+    await update_conversation_state(session=session, state=result["state"], db=db)
     return {"reply": result["output"]}
 
 @router.get("/sessions")

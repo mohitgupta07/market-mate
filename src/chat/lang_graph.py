@@ -1,208 +1,340 @@
-from typing import Dict, Any, List, Tuple, Annotated, Sequence, TypedDict
-from typing_extensions import TypedDict
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
-from langchain_core.language_models.chat_models import BaseChatModel
-from langgraph.graph import END, Graph
-from langchain_core.runnables import RunnableConfig
-from langchain_core.outputs import ChatResult, ChatGeneration
-from langchain.memory import ConversationBufferMemory, ConversationSummaryMemory
-from langchain.tools import tool
-from langchain.memory.chat_message_histories import PostgresChatMessageHistory
-from langchain.llms.base import LLM
-from src.auth.models import Message
-import random
-import os
 import asyncio
+import os
+from typing import Dict, List, Optional
+from langgraph.graph import StateGraph, END
+from langgraph.graph.state import CompiledStateGraph
+from pydantic import BaseModel
+import litellm
+from sqlalchemy.ext.asyncio import AsyncSession
+import json
+from datetime import datetime
+from .models import Message, RoleEnum, Conversation, User
+import uuid
 
-class AgentState(TypedDict):
-    messages: List[BaseMessage]
+# System prompt for financial data restriction and ReAct reasoning
+SYSTEM_PROMPT = """
+You are MarketMate, a financial market data expert. Your role is to answer queries exclusively related to financial market data, such as stock prices, company earnings, financial news, or quarterly results. Follow these guidelines:
+1. Use ReAct (Reasoning + Acting) to process queries:
+   - Reason: Analyze the query to determine if it pertains to financial market data (e.g., stocks, earnings, company financials). If the query is unrelated (e.g., weather, general knowledge, personal advice), conclude it’s invalid.
+   - Act: For valid financial queries, determine if data retrieval is needed via function calls (Financial News API or Quarterly Financial Results API). If so, state: "I will call the [API name] to fetch the required data."
+   - Evaluate: Assess the results and determine if further reasoning or actions are needed.
+2. If the query is not financial-related, respond with: "Sorry, I can only assist with financial market questions. Please ask about stocks, earnings, or financial news."
+3. Only call functions named 'get_financial_news' or 'get_quarterly_results'. Do not call other functions.
+4. Provide clear, concise, and accurate answers based on retrieved data or reasoning.
+5. If unsure, iterate up to 3 times to refine the reasoning or fetch additional data.
+"""
 
-# Mock financial API tool
-def mock_financial_api(query: str) -> str:
-    # Simulate a financial API response
-    responses = [
-        f"The current price of {query} is ${random.randint(100, 500)}.",
-        f"{query} is up {random.uniform(1, 5):.2f}% today.",
-        f"{query} has a market cap of ${random.randint(1, 100)}B."
-    ]
-    return random.choice(responses)
+# Mock Financial APIs
+async def get_financial_news(company_name: str) -> Dict:
+    return {
+        "company_name": company_name,
+        "news": [{"headline": f"Mock news for {company_name}", "description": "Sample news", "date": "2025-05-25", "source": "Mock"}]
+    }
 
-@tool
-def financial_tool(query: str) -> str:
-    """Get financial data for a given query (mocked)."""
-    return mock_financial_api(query)
+async def get_quarterly_results(company_name: str, quarter: str) -> Dict:
+    return {
+        "company_name": company_name,
+        "quarter": quarter,
+        "valuation_ratios": {"pe_ratio": 15.5, "pb_ratio": 2.3},
+        "files": {"balance_sheet": "https://dummyfinancialapi.com/files/balance_sheet.xlsx"}
+    }
 
-# LiteLLM wrapper for LangChain
-class LiteLLM(LLM):
-    def __init__(self, api_url: str, model: str, api_key: str = None, **kwargs):
-        self.api_url = api_url
-        self.model = model
-        self.api_key = api_key or os.getenv("LITELLM_API_KEY")
-        self.kwargs = kwargs
+# Function definitions for LLM
+FUNCTIONS = [
+    {
+        "name": "get_financial_news",
+        "description": "Fetch financial news for a company",
+        "parameters": {
+            "type": "object",
+            "properties": {"company_name": {"type": "string"}},
+            "required": ["company_name"]
+        }
+    },
+    {
+        "name": "get_quarterly_results",
+        "description": "Fetch quarterly financial results for a company",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "company_name": {"type": "string"},
+                "quarter": {"type": "string"}
+            },
+            "required": ["company_name", "quarter"]
+        }
+    }
+]
 
-    @property
-    def _llm_type(self) -> str:
-        return "litellm"
+# Function map for tool calls
+FUNCTION_MAP = {
+    "get_financial_news": get_financial_news,
+    "get_quarterly_results": get_quarterly_results
+}
 
-    def _call(self, prompt: str, stop: list = None) -> str:
-        import requests
-        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-        payload = {"model": self.model, "prompt": prompt}
-        payload.update(self.kwargs)
-        response = requests.post(self.api_url, json=payload, headers=headers)
-        response.raise_for_status()
-        return response.json().get("choices", [{}])[0].get("text", "")
+# LangGraph State
+class ChatState(BaseModel):
+    session_id: str
+    user_id: str
+    tier: str
+    user_query: str
+    messages: List[Dict[str, str]] = []
+    summary: Optional[str] = None
+    response: Optional[str] = None
+    is_financial: Optional[bool] = None
+    llm_client: Optional[Dict] = None
+    iteration: int = 0
+    max_iterations: int = 3
+    user_message_count: int = 0  # Track user messages for summary updates
 
-# --- PG Message History for stateless memory ---
-def get_pg_message_history(session_id: str) -> PostgresChatMessageHistory:
-    # If you want to use SQLAlchemy db connection, refactor this to use db instead of connection_string
-    from langchain.memory.chat_message_histories import PostgresChatMessageHistory
-    return PostgresChatMessageHistory(
-        session_id=session_id,
-        connection_string=os.getenv("PG_CONN_STRING"),
-        table_name="chat_message_history"
-    )
+# Input Node: Load messages and prepare state
+async def input_node(state: ChatState) -> ChatState:
+    # Messages already provided by caller (last K user/AI messages)
+    state.messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+    
+    # Count user messages for summary update condition
+    state.user_message_count = sum(1 for msg in state.messages if msg["role"] == "human")
+    return state
 
-# --- Store summary every k messages ---
-SUMMARY_EVERY_K = 10
+# CoT Node: ReAct-based reasoning and action
+async def cot_node(state: ChatState) -> ChatState:
+    if state.iteration >= state.max_iterations:
+        state.response = "Unable to process query after maximum reasoning attempts."
+        return state
+    
+    # Prepare messages for LLM
+    messages = state.messages + [{"role": "user", "content": state.user_query}]
+    if state.summary:
+        messages.insert(1, {"role": "system", "content": f"Conversation summary: {state.summary}"})
+    
+    # Call LLM to reason about query domain and actions
+    reasoning_prompt = f"""
+    Analyze the following query: "{state.user_query}"
+    Step 1: Reason about whether the query pertains to financial market data (e.g., stocks, earnings, company financials).
+    Step 2: If non-financial, conclude the query is invalid and respond with the rejection message.
+    Step 3: If financial, determine if a function call is needed to fetch data (e.g., Financial News API or Quarterly Financial Results API).
+    Step 4: If a function call is needed, specify which function and arguments.
+    Provide your reasoning and conclusion in a structured JSON format:
+    ```json
+    {
+        "reasoning": ["step 1", "step 2", ...],
+        "is_financial": true/false,
+        "function_call": {"name": "function_name", "arguments": {...}} or null,
+        "response": "text response if no function call or invalid query"
+    }
+    ```
+    """
+    messages.append({"role": "system", "content": reasoning_prompt})
+    
+    try:
+        response = await litellm.acompletion(
+            model=state.llm_client["model"],
+            provider=state.llm_client["provider"],
+            api_key=state.llm_client["api_key"],
+            messages=messages,
+            functions=FUNCTIONS,  # Pass available functions
+            function_call="auto",
+            temperature=0.7,
+            metadata=state.llm_client["metadata"]
+        )
+        
+        llm_message = response.choices[0].message
+        try:
+            reasoning_result = json.loads(llm_message.content) if llm_message.content else {}
+        except json.JSONDecodeError:
+            reasoning_result = {
+                "reasoning": ["Failed to parse LLM output as JSON"],
+                "is_financial": False,
+                "function_call": None,
+                "response": "Sorry, I encountered an error processing your query."
+            }
+        
+        state.is_financial = reasoning_result.get("is_financial", False)
+        state.messages.append({"role": "assistant", "content": llm_message.content or json.dumps(reasoning_result)})
+        
+        if not state.is_financial:
+            state.response = reasoning_result.get("response", "Sorry, I can only assist with financial market questions. Please ask about stocks, earnings, or financial news.")
+            return state
+        
+        if reasoning_result.get("function_call"):
+            state.messages.append({"role": "assistant", "content": json.dumps(reasoning_result)})
+            return state
+        
+        if reasoning_result.get("response"):
+            state.response = reasoning_result["response"]
+            return state
+        
+        # Loop back to CoT if response is incomplete
+        state.iteration += 1
+        return state
+    
+    except Exception as e:
+        state.response = f"Error processing query: {str(e)}"
+        state.is_financial = False
+        return state
 
-def store_summary_to_db(session_id: str, summary: str, db):
-    # Store summary in Conversation table (add a summary column if not present)
-    from src.auth.models import Conversation
-    from sqlalchemy import update
-    db.execute(update(Conversation).where(Conversation.id == session_id).values(summary=summary))
-    db.commit()
+# Tool Call Node: Execute function calls
+async def tool_call_node(state: ChatState) -> ChatState:
+    if state.iteration >= state.max_iterations:
+        state.response = "Unable to process query after maximum function calls."
+        return state
+    
+    last_message = state.messages[-1]
+    try:
+        reasoning_result = json.loads(last_message["content"]) if last_message["content"] else {}
+    except json.JSONDecodeError:
+        state.response = "Invalid reasoning output from previous step."
+        return state
+    
+    function_call = reasoning_result.get("function_call")
+    
+    if not function_call:
+        state.response = "No function call specified."
+        return state
+    
+    function_name = function_call.get("name")
+    args = function_call.get("arguments", {})
+    
+    if function_name not in FUNCTION_MAP:
+        state.response = "Invalid function call detected."
+        return state
+    
+    try:
+        result = await FUNCTION_MAP[function_name](**args)
+        state.messages.append({"role": "function", "content": json.dumps(result)})
+    except Exception as e:
+        state.response = f"Error executing function {function_name}: {str(e)}"
+        return state
+    
+    state.iteration += 1
+    return state
 
-# --- Multi-turn agentic graph with LLM selection and PG memory ---
-def create_graph(selected_llm: LLM, session_id: str, db=None) -> Graph:
-    workflow = Graph()
+# Invalid Query Node: Handle non-financial queries
+async def invalid_query_node(state: ChatState) -> ChatState:
+    state.response = state.response or "Sorry, I can only assist with financial market questions. Please ask about stocks, earnings, or financial news."
+    state.messages.append({"role": "assistant", "content": state.response})
+    return state
 
-    def cot_node(state: AgentState) -> Dict:
-        messages = state.get("messages", [])
-        messages.append(AIMessage(content="Let's think step by step."))
-        return {"messages": messages}
+# Summarizer Node: Update summary for every Kth user message
+async def summarizer_node(state: ChatState) -> ChatState:
+    K = 10
+    if state.user_message_count % K == 0 and state.user_message_count > 0:
+        try:
+            summary_response = await litellm.acompletion(
+                model=state.llm_client["model"],
+                provider=state.llm_client["provider"],
+                api_key=state.llm_client["api_key"],
+                messages=[{"role": "system", "content": "Summarize the conversation concisely, focusing on financial topics."}] + state.messages,
+                temperature=0.5,
+                metadata=state.llm_client["metadata"]
+            )
+            state.summary = summary_response.choices[0].message.content
+        except Exception as e:
+            state.summary = state.summary or ""  # Retain existing summary on error
+    return state
 
-    def tool_node(state: AgentState) -> Dict:
-        messages = state.get("messages", [])
-        last_user_msg = next((msg for msg in reversed(messages) if isinstance(msg, HumanMessage)), None)
-        if last_user_msg:
-            tool_result = financial_tool(last_user_msg.content)
-            messages.append(AIMessage(content=f"[Financial Tool]: {tool_result}"))
-        return {"messages": messages}
+# Output Node: Prepare state for external DB update
+async def output_node(state: ChatState) -> ChatState:
+    return state
 
-    def summarizer_node(state: AgentState) -> Dict:
-        messages = state.get("messages", [])
-        memory = ConversationSummaryMemory(llm=selected_llm)
-        for msg in messages:
-            if isinstance(msg, HumanMessage):
-                memory.save_context({"input": msg.content}, {})
-            elif isinstance(msg, AIMessage):
-                memory.save_context({}, {"output": msg.content})
-        summary = memory.buffer
-        messages.append(AIMessage(content=f"Summary so far: {summary}"))
-        # Store summary every k messages
-        if db and len([m for m in messages if isinstance(m, HumanMessage)]) % SUMMARY_EVERY_K == 0:
-            store_summary_to_db(session_id, summary, db)
-        return {"messages": messages}
-
-    def buffer_memory_node(state: AgentState) -> Dict:
-        messages = state.get("messages", [])
-        # Use PG message history for stateless buffer
-        chat_history = get_pg_message_history(session_id)
-        memory = ConversationBufferMemory(chat_memory=chat_history, k=5, return_messages=True)
-        for msg in messages:
-            if isinstance(msg, HumanMessage):
-                memory.save_context({"input": msg.content}, {})
-            elif isinstance(msg, AIMessage):
-                memory.save_context({}, {"output": msg.content})
-        buffer = memory.buffer
-        messages.append(AIMessage(content=f"Buffer memory: {buffer}"))
-        return {"messages": messages}
-
-    def aggregator_node(state: AgentState) -> Dict:
-        messages = state.get("messages", [])
-        ai_responses = [msg.content for msg in messages if isinstance(msg, AIMessage)]
-        final_response = "\n".join(ai_responses)
-        messages.append(AIMessage(content=f"Final aggregated answer: {final_response}"))
-        return {"messages": messages}
-
+# Build Workflow
+def build_workflow() -> CompiledStateGraph:
+    workflow = StateGraph(ChatState)
+    
+    workflow.add_node("input", input_node)
     workflow.add_node("cot", cot_node)
-    workflow.add_node("tool", tool_node)
+    workflow.add_node("tool_call", tool_call_node)
+    workflow.add_node("invalid_query", invalid_query_node)
     workflow.add_node("summarizer", summarizer_node)
-    workflow.add_node("buffer_memory", buffer_memory_node)
-    workflow.add_node("aggregator", aggregator_node)
-    workflow.add_node("end", lambda state: state)
-    workflow.set_entry_point("cot")
-    workflow.add_edge("cot", "tool")
-    workflow.add_edge("tool", "summarizer")
-    workflow.add_edge("summarizer", "buffer_memory")
-    workflow.add_edge("buffer_memory", "aggregator")
-    workflow.add_edge("aggregator", "end")
+    workflow.add_node("output", output_node)
+    
+    workflow.set_entry_point("input")
+    workflow.add_edge("input", "cot")
+    workflow.add_conditional_edges(
+        "cot",
+        lambda state: (
+            "invalid_query" if not state.is_financial else
+            "tool_call" if json.loads(state.messages[-1]["content"]).get("function_call") else
+            "cot" if not state.response and state.iteration < state.max_iterations else
+            "summarizer"
+        )
+    )
+    workflow.add_edge("tool_call", "cot")  # Loop back to CoT for ReAct iteration
+    workflow.add_edge("invalid_query", "output")
+    workflow.add_edge("summarizer", "output")
+    workflow.add_edge("output", END)
+    
     return workflow.compile()
 
-def process_message(message: str, history: List[Dict[str, str]], session_id: str, llm: LLM, db=None, summary: str = None) -> Dict[str, Any]:
-    messages = []
-    if summary:
-        # Optionally prepend summary as a system message
-        messages.append(AIMessage(content=f"Summary: {summary}"))
-    for msg in history:
-        if msg["role"] == "user":
-            messages.append(HumanMessage(content=msg["content"]))
-        else:
-            messages.append(AIMessage(content=msg["content"]))
-    messages.append(HumanMessage(content=message))
-    state = {"messages": messages}
-    graph = create_graph(llm, session_id, db)
-    result = graph.invoke(state, {"config": {}}) or {"messages": []}
-    final_messages = result.get("messages", [])
-    assistant_message = final_messages[-1].content if final_messages else ""
-    new_history = []
-    for msg in final_messages:
-        role = "user" if isinstance(msg, HumanMessage) else "assistant"
-        new_history.append({"role": role, "content": msg.content})
-    return {
-        "output": assistant_message,
-        "history": new_history
-    }
-
-async def run_chat_graph(session, user_message: str, db):
+# Database Update Function
+async def update_conversation_state(session: Conversation, state: ChatState, db: AsyncSession) -> None:
     """
-    Orchestrate the chat graph: fetch last k messages, summary, add system prompt, run COT, tool, aggregator, summarizer, and update DB.
+    Update the conversation state in the database.
+    
+    Args:
+        session: Conversation object from DB
+        state: ChatState object from LangGraph
+        db: Async SQLAlchemy session
     """
-    from .lang_graph import LiteLLM, create_graph
-    k = 10
-    # Fetch last k messages
-    result = await db.execute(
-        Message.__table__.select()
-        .where(Message.conversation_id == session.id)
-        .order_by(Message.timestamp.desc())
-        .limit(k)
+    # Add user message
+    user_message = Message(
+        conversation_id=session.id,
+        role=RoleEnum.human,
+        content=state.user_query,
+        timestamp=datetime.utcnow()
     )
-    messages = list(reversed(result.fetchall()))
-    history = [
-        {"role": msg.role, "content": msg.content}
-        for msg in messages
-    ]
-    summary = getattr(session, "summary", None)
-    selected_llm_model = getattr(session, "llm_model", "gpt-3.5-turbo")
-    llm = LiteLLM(api_url=os.getenv("LITELLM_API_URL"), model=selected_llm_model)
-    # Build system prompt
-    system_prompt = "You are a helpful AI assistant."
-    # Compose state for graph
-    state = {
-        "messages": [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_message}],
-        "summary": summary,
-        "session_id": str(session.id),
-        "db": db,
-        "session": session
-    }
-    # Run the graph (sync for now, can be made async if needed)
-    graph = create_graph(llm, str(session.id), db)
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, lambda: graph.invoke(state, {"config": {}}))
-    # After graph, update DB with user/AI messages and summary if needed
-    # (Assume graph nodes handle DB updates for summary/messages)
-    return result
+    db.add(user_message)
+    
+    # Add AI response (if any)
+    if state.response:
+        ai_message = Message(
+            conversation_id=session.id,
+            role=RoleEnum.ai,
+            content=state.response,
+            timestamp=datetime.utcnow()
+        )
+        db.add(ai_message)
+    
+    # Update summary
+    session.summary = state.summary or session.summary
+    session.updated_at = datetime.utcnow()
+    
+    await db.commit()
 
-# Global instance
-graph = process_message
+# Exposed Function for FastAPI
+async def run_chat_graph(session: Conversation, user_message: str, user: User) -> Dict:
+    """
+    Run the LangGraph workflow for a chat session.
+    
+    Args:
+        session: Conversation object from DB with session_id, user_id, messages, summary
+        user_message: User input message
+        user: FastAPI-Users user object with id and tier
+    
+    Returns:
+        Dict with 'output' key containing the LLM response and 'state' for DB updates
+    """
+    # Fetch last K=10 user/AI messages
+    K = 10
+    messages = [
+        {"role": msg.role.value, "content": msg.content}
+        for msg in session.messages
+        if msg.role in [RoleEnum.human, RoleEnum.ai]
+    ][-K:]
+    
+    workflow = build_workflow()
+    state = ChatState(
+        session_id=str(session.id),
+        user_id=str(user.id),
+        tier=user.tier,
+        user_query=user_message,
+        messages=messages,
+        summary=session.summary or "",
+        user_message_count=len([msg for msg in session.messages if msg.role == RoleEnum.human]) + 1,
+        llm_client={
+            "model": session.llm_model,
+            "provider": "openai",
+            "api_key": os.getenv("LITELLM_API_KEY"),
+            "metadata": {"user_id": str(user.id), "tier": user.tier}
+        }
+    )
+    result = await workflow.ainvoke(state)
+    return {"output": result.response or "No response generated.", "state": result}
