@@ -1,18 +1,17 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from src.auth.users import fastapi_users
-from src.auth.database import SessionLocal
+from src.auth.database import get_db
 from src.auth.models import User, Conversation, Message, RoleEnum
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 import uuid
 from typing import Dict
 import os
-
+import structlog
 router = APIRouter()
+logger = structlog.get_logger()
 
-async def get_db():
-    async with SessionLocal() as session:
-        yield session
 
 # Example: simple rate limiter (mock, not production)
 # RATE_LIMITS = {"free": 10, "pro": 100, "enterprise": 1000}  # requests per hour
@@ -40,16 +39,24 @@ async def message(
     db: AsyncSession = Depends(get_db)
 ):
     """Send a message in a chat session"""
+    logger.info(f"message called: {message}")
+    user = await db.get(User, user.id, options=[selectinload(User.conversations)])
     # Get session and verify ownership
-    session = await db.get(Conversation, session_id)
+    logger.info("Fetching session")
+    session = await db.get(Conversation, session_id, options=[selectinload(Conversation.messages)])
     if not session or session.user_id != user.id:
         raise HTTPException(status_code=404, detail="Session not found")
-
+    logger.info(f"session id: {session.id}")
+    logger.info(f"session : {session.messages}")
+    if session.messages is None:
+        session.messages = []
+    logger.info(f"Processing message: {len(session.messages)} messages")
     # Call the LangGraph runner as the only handler
-    from .lang_graph import run_chat_graph, update_conversation_state
-    result = await run_chat_graph(session=session, user_message=message, user= user)
-    await update_conversation_state(session=session, state=result["state"], db=db)
-    return {"reply": result["output"]}
+    from src.chat.reasoning import run_chat_graph, update_conversation_state
+
+    result_state = await run_chat_graph(session=session, user_message=message, user= user)
+    await update_conversation_state(session=session, state=result_state, db=db)
+    return {"reply": result_state.get("response", "No response generated.")}
 
 @router.get("/sessions")
 async def list_sessions(

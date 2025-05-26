@@ -8,19 +8,19 @@ from typing import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .database import SessionLocal
+from .database import SessionLocal, get_db
 from .models import User
 
 
 SECRET = "SUPERSECRETKEY"
 
-# Dependency
-async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
-    async with SessionLocal() as session:
-        yield session
+# # Dependency
+# async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
+#     async with SessionLocal() as session:
+#         yield session
 
 # Adapter
-async def get_user_db(session: AsyncSession = Depends(get_async_session)):
+async def get_user_db(session: AsyncSession = Depends(get_db)):
     yield SQLAlchemyUserDatabase(session, User)
 
 # Auth backend

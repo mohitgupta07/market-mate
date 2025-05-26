@@ -46,8 +46,9 @@ class Conversation(Base):
 # --- Enum for message roles ---
 class RoleEnum(str, enum.Enum):
     system = "system"
-    user = "human"
-    ai = "ai"
+    user = "user"
+    human = "user"
+    ai = "assistant"
 
 
 # --- Message model ---
