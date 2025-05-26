@@ -8,10 +8,32 @@ import litellm
 from sqlalchemy.ext.asyncio import AsyncSession
 import json
 from datetime import datetime
-from .models import Message, RoleEnum, Conversation, User
+from src.auth.models import Message, RoleEnum, Conversation, User
 import uuid
+import structlog
+from prometheus_client import Counter
+from tenacity import retry, stop_after_attempt, wait_fixed
 
-# System prompt for financial data restriction and ReAct reasoning
+# Structured logging
+structlog.configure(
+    processors=[
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.stdlib.add_log_level,
+        structlog.processors.JSONRenderer()
+    ],
+    context_class=dict,
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    wrapper_class=structlog.stdlib.BoundLogger,
+    cache_logger_on_first_use=True,
+)
+logger = structlog.get_logger()
+
+# Metrics
+cot_iterations = Counter("cot_node_iterations", "Number of CoT node iterations")
+function_calls = Counter("function_calls", "Number of function calls", ["function_name"])
+errors = Counter("workflow_errors", "Number of errors in workflow", ["node"])
+
+# System prompt
 SYSTEM_PROMPT = """
 You are MarketMate, a financial market data expert. Your role is to answer queries exclusively related to financial market data, such as stock prices, company earnings, financial news, or quarterly results. Follow these guidelines:
 1. Use ReAct (Reasoning + Acting) to process queries:
@@ -83,29 +105,30 @@ class ChatState(BaseModel):
     llm_client: Optional[Dict] = None
     iteration: int = 0
     max_iterations: int = 3
-    user_message_count: int = 0  # Track user messages for summary updates
+    user_message_count: int = 0
 
-# Input Node: Load messages and prepare state
+# Input Node
 async def input_node(state: ChatState) -> ChatState:
-    # Messages already provided by caller (last K user/AI messages)
+    logger.info("Entering input node", session_id=state.session_id, user_query=state.user_query)
     state.messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
-    
-    # Count user messages for summary update condition
     state.user_message_count = sum(1 for msg in state.messages if msg["role"] == "human")
     return state
 
-# CoT Node: ReAct-based reasoning and action
+# CoT Node
+@retry(stop=stop_after_attempt(2), wait=wait_fixed(1))
 async def cot_node(state: ChatState) -> ChatState:
+    logger.info("Entering CoT node", session_id=state.session_id, iteration=state.iteration)
+    cot_iterations.inc()
+    
     if state.iteration >= state.max_iterations:
         state.response = "Unable to process query after maximum reasoning attempts."
+        logger.warning("Max iterations reached", session_id=state.session_id)
         return state
     
-    # Prepare messages for LLM
     messages = state.messages + [{"role": "user", "content": state.user_query}]
     if state.summary:
         messages.insert(1, {"role": "system", "content": f"Conversation summary: {state.summary}"})
     
-    # Call LLM to reason about query domain and actions
     reasoning_prompt = f"""
     Analyze the following query: "{state.user_query}"
     Step 1: Reason about whether the query pertains to financial market data (e.g., stocks, earnings, company financials).
@@ -127,10 +150,10 @@ async def cot_node(state: ChatState) -> ChatState:
     try:
         response = await litellm.acompletion(
             model=state.llm_client["model"],
-            provider=state.llm_client["provider"],
+            api_base=state.llm_client["api_base"],
             api_key=state.llm_client["api_key"],
             messages=messages,
-            functions=FUNCTIONS,  # Pass available functions
+            functions=FUNCTIONS,
             function_call="auto",
             temperature=0.7,
             metadata=state.llm_client["metadata"]
@@ -146,35 +169,45 @@ async def cot_node(state: ChatState) -> ChatState:
                 "function_call": None,
                 "response": "Sorry, I encountered an error processing your query."
             }
+            logger.error("JSON parse error in CoT node", session_id=state.session_id, error="Invalid JSON")
+            errors.labels(node="cot").inc()
         
         state.is_financial = reasoning_result.get("is_financial", False)
         state.messages.append({"role": "assistant", "content": llm_message.content or json.dumps(reasoning_result)})
         
         if not state.is_financial:
             state.response = reasoning_result.get("response", "Sorry, I can only assist with financial market questions. Please ask about stocks, earnings, or financial news.")
+            logger.info("Non-financial query detected", session_id=state.session_id)
             return state
         
         if reasoning_result.get("function_call"):
             state.messages.append({"role": "assistant", "content": json.dumps(reasoning_result)})
+            logger.info("Function call triggered", session_id=state.session_id, function=reasoning_result["function_call"]["name"])
             return state
         
         if reasoning_result.get("response"):
             state.response = reasoning_result["response"]
+            logger.info("Final response generated", session_id=state.session_id)
             return state
         
-        # Loop back to CoT if response is incomplete
         state.iteration += 1
+        logger.info("Incomplete response, looping back", session_id=state.session_id, iteration=state.iteration)
         return state
     
     except Exception as e:
+        logger.error("Error in CoT node", session_id=state.session_id, error=str(e))
+        errors.labels(node="cot").inc()
         state.response = f"Error processing query: {str(e)}"
         state.is_financial = False
         return state
 
-# Tool Call Node: Execute function calls
+# Tool Call Node
 async def tool_call_node(state: ChatState) -> ChatState:
+    logger.info("Entering tool call node", session_id=state.session_id, iteration=state.iteration)
+    
     if state.iteration >= state.max_iterations:
         state.response = "Unable to process query after maximum function calls."
+        logger.warning("Max iterations reached in tool call", session_id=state.session_id)
         return state
     
     last_message = state.messages[-1]
@@ -182,12 +215,15 @@ async def tool_call_node(state: ChatState) -> ChatState:
         reasoning_result = json.loads(last_message["content"]) if last_message["content"] else {}
     except json.JSONDecodeError:
         state.response = "Invalid reasoning output from previous step."
+        logger.error("JSON parse error in tool call node", session_id=state.session_id)
+        errors.labels(node="tool_call").inc()
         return state
     
     function_call = reasoning_result.get("function_call")
     
     if not function_call:
         state.response = "No function call specified."
+        logger.warning("No function call in reasoning result", session_id=state.session_id)
         return state
     
     function_name = function_call.get("name")
@@ -195,44 +231,56 @@ async def tool_call_node(state: ChatState) -> ChatState:
     
     if function_name not in FUNCTION_MAP:
         state.response = "Invalid function call detected."
+        logger.error("Invalid function call", session_id=state.session_id, function_name=function_name)
+        errors.labels(node="tool_call").inc()
         return state
     
     try:
         result = await FUNCTION_MAP[function_name](**args)
         state.messages.append({"role": "function", "content": json.dumps(result)})
+        function_calls.labels(function_name=function_name).inc()
+        logger.info("Function call executed", session_id=state.session_id, function_name=function_name)
     except Exception as e:
         state.response = f"Error executing function {function_name}: {str(e)}"
+        logger.error("Function call error", session_id=state.session_id, function_name=function_name, error=str(e))
+        errors.labels(node="tool_call").inc()
         return state
     
     state.iteration += 1
     return state
 
-# Invalid Query Node: Handle non-financial queries
+# Invalid Query Node
 async def invalid_query_node(state: ChatState) -> ChatState:
+    logger.info("Entering invalid query node", session_id=state.session_id)
     state.response = state.response or "Sorry, I can only assist with financial market questions. Please ask about stocks, earnings, or financial news."
     state.messages.append({"role": "assistant", "content": state.response})
     return state
 
-# Summarizer Node: Update summary for every Kth user message
+# Summarizer Node
 async def summarizer_node(state: ChatState) -> ChatState:
+    logger.info("Entering summarizer node", session_id=state.session_id)
     K = 10
     if state.user_message_count % K == 0 and state.user_message_count > 0:
         try:
             summary_response = await litellm.acompletion(
                 model=state.llm_client["model"],
-                provider=state.llm_client["provider"],
+                api_base=state.llm_client["api_base"],
                 api_key=state.llm_client["api_key"],
                 messages=[{"role": "system", "content": "Summarize the conversation concisely, focusing on financial topics."}] + state.messages,
                 temperature=0.5,
                 metadata=state.llm_client["metadata"]
             )
             state.summary = summary_response.choices[0].message.content
+            logger.info("Summary updated", session_id=state.session_id)
         except Exception as e:
-            state.summary = state.summary or ""  # Retain existing summary on error
+            logger.error("Error in summarizer node", session_id=state.session_id, error=str(e))
+            errors.labels(node="summarizer").inc()
+            state.summary = state.summary or ""
     return state
 
-# Output Node: Prepare state for external DB update
+# Output Node
 async def output_node(state: ChatState) -> ChatState:
+    logger.info("Entering output node", session_id=state.session_id)
     return state
 
 # Build Workflow
@@ -266,15 +314,7 @@ def build_workflow() -> CompiledStateGraph:
 
 # Database Update Function
 async def update_conversation_state(session: Conversation, state: ChatState, db: AsyncSession) -> None:
-    """
-    Update the conversation state in the database.
-    
-    Args:
-        session: Conversation object from DB
-        state: ChatState object from LangGraph
-        db: Async SQLAlchemy session
-    """
-    # Add user message
+    logger.info("Updating conversation state", session_id=session.id)
     user_message = Message(
         conversation_id=session.id,
         role=RoleEnum.human,
@@ -283,7 +323,6 @@ async def update_conversation_state(session: Conversation, state: ChatState, db:
     )
     db.add(user_message)
     
-    # Add AI response (if any)
     if state.response:
         ai_message = Message(
             conversation_id=session.id,
@@ -293,26 +332,18 @@ async def update_conversation_state(session: Conversation, state: ChatState, db:
         )
         db.add(ai_message)
     
-    # Update summary
     session.summary = state.summary or session.summary
     session.updated_at = datetime.utcnow()
     
     await db.commit()
 
-# Exposed Function for FastAPI
-async def run_chat_graph(session: Conversation, user_message: str, user: User) -> Dict:
-    """
-    Run the LangGraph workflow for a chat session.
-    
-    Args:
-        session: Conversation object from DB with session_id, user_id, messages, summary
-        user_message: User input message
-        user: FastAPI-Users user object with id and tier
-    
-    Returns:
-        Dict with 'output' key containing the LLM response and 'state' for DB updates
-    """
-    # Fetch last K=10 user/AI messages
+# FastAPI Endpoint
+async def run_chat_graph(
+    session: Conversation,
+    user_message: str,
+    user: User,
+) -> Dict:
+    logger.info("Running chat graph", session_id=str(session.id), user_id=str(user.id))
     K = 10
     messages = [
         {"role": msg.role.value, "content": msg.content}
@@ -330,9 +361,9 @@ async def run_chat_graph(session: Conversation, user_message: str, user: User) -
         summary=session.summary or "",
         user_message_count=len([msg for msg in session.messages if msg.role == RoleEnum.human]) + 1,
         llm_client={
-            "model": session.llm_model,
-            "provider": "openai",
-            "api_key": os.getenv("LITELLM_API_KEY"),
+            "model": session.llm_model,  # e.g., "gemini/gemini-1.5-pro"
+            "api_base": "http://localhost:4000",
+            "api_key": os.getenv("LITELLM_API_KEY", "sk-1234"),
             "metadata": {"user_id": str(user.id), "tier": user.tier}
         }
     )

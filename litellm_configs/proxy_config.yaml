@@ -1,0 +1,19 @@
+model_list:
+  - model_name: gemini-2.0-flash
+    litellm_params:
+      model: gemini/gemini-2.0-flash
+      api_key: os.environ/GEMINI_API_KEY
+general_settings:
+  telemetry_enabled: false
+  master_key: sk-1234  # Optional: for proxy authentication
+rate_limit:
+  requests_per_minute: 100  # Free tier: 3 RPM
+
+
+  # curl http://localhost:4000/chat/completions \
+  # -H "Content-Type: application/json" \
+  # -H "Authorization: Bearer sk-1234" \
+  # -d '{
+  #   "model": "gemini-2.0-flash",
+  #   "messages": [{"role": "user", "content": "What is the capital of France?"}],
+  # }'
