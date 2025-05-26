@@ -30,7 +30,7 @@ class ChatState(BaseModel):
     is_financial: Optional[bool] = None
     llm_client: Optional[Dict] = None
     iteration: int = 0
-    max_iterations: int = 3
+    max_iterations: int = 7
     user_message_count: int = 0
     finish_reason: Optional[str] = None
 
@@ -87,7 +87,7 @@ async def input_node(state: ChatState) -> ChatState:
     return state
 
 # CoT Node
-@retry(stop=stop_after_attempt(2), wait=wait_fixed(1))
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
 async def cot_node(state: ChatState) -> ChatState:
     logger.info(
         "Entering CoT node",
@@ -353,7 +353,8 @@ async def run_chat_graph(
     provider = session.llm_model.split("/")[0]
     api_base = {
         "gemini": "https://generativelanguage.googleapis.com",
-        "xai": "https://api.x.ai/v1"
+        "xai": "https://api.x.ai/v1",
+        "litellm_proxy" : "http://localhost:4000"
     }.get(provider, "http://localhost:4000")
 
     workflow = build_workflow()
