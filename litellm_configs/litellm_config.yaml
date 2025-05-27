@@ -1,0 +1,88 @@
+model_list:
+  # Gemini model from provided config
+  - model_name: gemini-2.0-flash
+    litellm_params:
+      model: gemini/gemini-2.0-flash
+      api_key: os.environ/GEMINI_API_KEY
+      temperature: 0.7  # Default temperature
+      max_tokens: 4096  # Default max tokens
+
+  # OpenAI gpt-40 model from MarketMate assignment
+  - model_name: gpt-40
+    litellm_params:
+      model: openai/gpt-40
+      api_base: https://1lmprovider.com/chat/completions  # Dummy endpoint from assignment
+      api_key: dummy-api-key  # Replace with actual key or env variable
+      temperature: 0.7
+      max_tokens: 4096
+
+general_settings:
+  telemetry_enabled: false
+  master_key: sk-1234  # From provided config for proxy authentication
+  rate_limit_enabled: true
+  rate_limit_store: in-memory  # Assumes Redis; use "in-memory" if unavailable
+  redis_config:
+    host: localhost
+    port: 6379
+    db: 0
+  default_rate_limit_error:
+    status_code: 429
+    message: "Rate limit exceeded. Please check your tier's limits or try again later."
+  rate_limit:
+    default:
+      rpm_limit: 1  # 5 requests per minute per key
+      tpm_limit: 10000  # 10,000 tokens per minute per key
+
+litellm_settings:
+  drop_params: true
+
+rate_limit_settings:
+  # Gemini-2.0-flash (from provided config, assuming Free tier)
+  - team: free_tier
+    provider: gemini
+    model: gemini-2.0-flash
+    rpm: 1  # From provided config
+    rpd: 2  # Assumed; not specified in provided config
+    tpm: 40000  # Assumed to match Free tier gpt-40 for consistency
+    tpd: 1000000  # Assumed to match Free tier gpt-40
+    error_message: "You have reached the rate limit for the Free Tier (100 RPM or 1,000 RPD or 40,000 TPM or 1,000,000 TPD). Please upgrade or try again later."
+
+  # Free Tier for gpt-40 (from MarketMate assignment)
+  - team: free_tier
+    provider: openai
+    model: gpt-40
+    rpm: 3
+    rpd: 200
+    tpm: 40000
+    tpd: 1000000
+    error_message: "You have reached the rate limit for the Free Tier (3 RPM or 200 RPD or 40,000 TPM or 1,000,000 TPD). Please upgrade to a higher tier or try again later."
+
+  # Tier-1 for gpt-40
+  - team: tier_1
+    provider: openai
+    model: gpt-40
+    rpm: 500
+    rpd: 10000
+    tpm: 200000
+    tpd: 5000000
+    error_message: "You have reached the rate limit for Tier-1 (500 RPM or 10,000 RPD or 200,000 TPM or 5,000,000 TPD). Please upgrade to Tier-2 or try again later."
+
+  # Tier-2 for gpt-40
+  - team: tier_2
+    provider: openai
+    model: gpt-40
+    rpm: 5000
+    rpd: 100000
+    tpm: 2000000
+    tpd: 50000000
+    error_message: "You have reached the rate limit for Tier-2 (5,000 RPM or 100,000 RPD or 2,000,000 TPM or 50,000,000 TPD). Please upgrade to Tier-3 or try again later."
+
+  # Tier-3 for gpt-40
+  - team: tier_3
+    provider: openai
+    model: gpt-40
+    rpm: 50000
+    rpd: 1000000
+    tpm: 20000000
+    tpd: 50000000
+    error_message: "You have reached the rate limit for Tier-3 (50,000 RPM or 1,000,000 RPD or 20,000,000 TPM or 50,000,000 TPD). Please contact support for further assistance."

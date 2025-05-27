@@ -1,0 +1,6 @@
+{
+  "name": "Market Mate",
+  "description": "A chatbot application that interacts with a backend API to provide assistance and information, presumably market-related based on its name. Users can authenticate, manage chat sessions, and converse with an AI model.",
+  "requestFramePermissions": [],
+  "prompt": ""
+}

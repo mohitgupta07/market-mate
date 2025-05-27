@@ -2,6 +2,7 @@ import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from fastapi import FastAPI, Depends
+from fastapi.middleware.cors import CORSMiddleware
 
 from auth.database import engine, Base
 from auth.users import fastapi_users, auth_backend
@@ -11,6 +12,22 @@ from chat import router as chat_router
 
 # Create app and routes
 app = FastAPI()
+
+origins = [
+    "http://localhost", # Your frontend's origin if served from a different port
+    "http://localhost:3000", # Example if using React dev server
+    "http://localhost:5173", # Example if using Vite dev server
+    "http://127.0.0.1:5500", # Example if using VS Code Live Server
+    # Add the specific origin your frontend is running on
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,  # Allows specific origins
+    allow_credentials=True, # Allows cookies to be included in requests
+    allow_methods=["*"],    # Allows all methods (GET, POST, PUT, DELETE, etc.)
+    allow_headers=["*"],    # Allows all headers
+)
 
 app.include_router(
     fastapi_users.get_auth_router(auth_backend), prefix="/auth/jwt", tags=["auth"]

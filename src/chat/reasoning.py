@@ -3,6 +3,7 @@ import os
 from typing import Dict, List, Optional
 
 import pytest_asyncio
+from langchain.chains.question_answering.map_reduce_prompt import messages
 from langgraph.graph import StateGraph, END
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import BaseModel
@@ -102,8 +103,9 @@ async def cot_node(state: ChatState) -> ChatState:
         state.response = "Unable to process query after maximum reasoning attempts."
         logger.warning("Max iterations reached", session_id=state.session_id)
         return state
-
-    messages = state.messages + [{"role": "user", "content": state.user_query}]
+    messages = state.messages
+    if state.iteration == 0:
+        messages = messages + [{"role": "user", "content": state.user_query}]
     if state.summary:
         messages.insert(1, {"role": "system", "content": f"Conversation summary: {state.summary}"})
 
@@ -247,11 +249,11 @@ async def summarizer_node(state: ChatState) -> ChatState:
         model=state.llm_client["model"],
         api_base=state.llm_client["api_base"]
     )
-    K = 20
-    if state.user_message_count % K == 0 and state.user_message_count > 0:
+    K = 2
+    if len(state.messages) > 0:
         try:
             messages = [{"role": "system",
-                         "content": "Provide a concise summary (50-100 words) of the conversation, focusing on financial topics and key user queries."}] + state.messages[-K:]
+                         "content": f"Provide a concise summary (50-100 words) of the conversation, focusing on financial topics and key user queries. Previous summary {state.summary}. <previous-summary-end>"}] + state.messages[1:]
             summary_response = await call_llm(state, messages, temperature=0.5)
             state.summary = summary_response.choices[0].message.content
             logger.info("Summary updated", session_id=state.session_id, summary_length=len(state.summary))
@@ -284,9 +286,9 @@ def build_workflow() -> CompiledStateGraph:
         "cot",
         lambda state: (
             "tool_call" if state.messages[-1].get("tool_calls") else
-            "output" if state.finish_reason == "stop" or state.response else
+            "summarizer" if state.finish_reason == "stop" or state.response else
             "cot" if state.iteration < state.max_iterations else
-            "summarizer"
+            "output"
         )
     )
     workflow.add_conditional_edges(
@@ -349,7 +351,8 @@ async def run_chat_graph(
                    ][-K:]
     else:
         logger.warning("session.messages is None, initializing empty list", session_id=str(session.id))
-
+    # todo: forcing to use this one for now.
+    session.llm_model = "litellm_proxy/gemini-2.0-flash"
     provider = session.llm_model.split("/")[0]
     api_base = {
         "gemini": "https://generativelanguage.googleapis.com",
